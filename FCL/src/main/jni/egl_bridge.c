@@ -62,8 +62,87 @@ static int lastSwapInterval = -1;
 
 static atomic_uint fps = 0;
 
+/* ===================== fcl_framegen hook begin ===================== */
+#include <android/log.h>
+#define FG_LOG(...) __android_log_print(ANDROID_LOG_INFO, "FclFrameGen", __VA_ARGS__)
+
+/* 必须与 framegen/include/fg_api.h 里的 FCL_FG_ABI_VERSION 保持一致 */
+#define FCL_FG_ABI_VERSION 2
+
+typedef struct {
+    int  (*abi)(void);
+    int  (*init)(void);
+    void (*shutdown)(void);
+    void (*frame_ready)(int, int);
+    int  (*present_extra)(int, int);
+    int  (*present_m1)(int, int);
+    int  (*present_real)(int, int);
+} FclFgApi;
+
+static FclFgApi g_fgApi;
+static int      g_fgState;   /* 0=未加载/已释放  1=可用  2=加载失败 */
+static int      g_fgW, g_fgH;
+static int      g_fgSinceRelease;
+
+static void fclFgLoad(void) {
+    if (g_fgState == 1) return;
+    if (g_fgState == 2) return;
+
+    void *h = dlopen("libfcl_framegen.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        g_fgState = 2;
+        FG_LOG("libfcl_framegen.so not found: %s", dlerror());
+        return;
+    }
+
+    g_fgApi.abi           = (int  (*)(void))     dlsym(h, "fcl_fg_abi_version");
+    g_fgApi.init          = (int  (*)(void))     dlsym(h, "fcl_fg_init");
+    g_fgApi.shutdown      = (void (*)(void))     dlsym(h, "fcl_fg_shutdown");
+    g_fgApi.frame_ready   = (void (*)(int, int)) dlsym(h, "fcl_fg_on_frame_ready");
+    g_fgApi.present_extra = (int  (*)(int, int)) dlsym(h, "fcl_fg_present_extra");
+    g_fgApi.present_m1    = (int  (*)(int, int)) dlsym(h, "fcl_fg_present_m1");
+    g_fgApi.present_real  = (int  (*)(int, int)) dlsym(h, "fcl_fg_present_real");
+
+    if (!g_fgApi.frame_ready || !g_fgApi.present_extra) {
+        g_fgState = 2;
+        FG_LOG("symbols missing in libfcl_framegen.so");
+        return;
+    }
+    if (g_fgApi.abi && g_fgApi.abi() != FCL_FG_ABI_VERSION) {
+        g_fgState = 2;
+        FG_LOG("abi mismatch, module disabled");
+        return;
+    }
+    if (g_fgApi.init && g_fgApi.init() != 0) {
+        g_fgState = 2;
+        FG_LOG("init() failed, module disabled");
+        return;
+    }
+    g_fgState = 1;
+    g_fgSinceRelease++;
+    FG_LOG("module attached (session #%d)", g_fgSinceRelease);
+}
+
+static void fclFgSize(void) {
+    g_fgW = g_fgH = 0;
+    if (pojav_environ->pojavWindow == NULL) return;
+    g_fgW = ANativeWindow_getWidth(pojav_environ->pojavWindow);
+    g_fgH = ANativeWindow_getHeight(pojav_environ->pojavWindow);
+}
+
+static void fclFgRelease(const char *why) {
+    if (g_fgState != 1) return;
+    if (g_fgApi.shutdown) g_fgApi.shutdown();
+    g_fgState = 0;
+    g_fgApi.frame_ready = NULL;
+    g_fgApi.present_extra = NULL;
+    FG_LOG("module released (%s)", why);
+}
+/* ===================== fcl_framegen hook end ===================== */
+
 EXTERNAL_API void pojavTerminate() {
     printf("EGLBridge: Terminating\n");
+    fclFgRelease("terminate");
 
     switch (pojav_environ->config_renderer) {
         case RENDERER_GL4ES: {
@@ -94,6 +173,7 @@ Java_org_lwjgl_glfw_CallbackBridge_setupBridgeWindow(JNIEnv *env, ABI_COMPAT jcl
     // 首个窗口由 pojavInit 应用交换间隔；此处处理窗口重建（旋转、分屏等）：
     // 生产者状态会随新窗口重置，若不重新应用，MC 不会再次发起交换间隔调用，帧率会退回锁定在屏幕刷新率
     bool windowRecreated = pojav_environ->pojavWindow != NULL;
+    if (windowRecreated) fclFgRelease("surface recreated");   /* 尺寸可能变了，强制重建缓冲 */
     pojav_environ->pojavWindow = ANativeWindow_fromSurface(env, surface);
     if (windowRecreated && pojav_environ->config_renderer != RENDERER_VULKAN) {
         if (lastSwapInterval >= 0) setNativeWindowSwapInterval(pojav_environ->pojavWindow, lastSwapInterval);
@@ -106,6 +186,7 @@ Java_org_lwjgl_glfw_CallbackBridge_setupBridgeWindow(JNIEnv *env, ABI_COMPAT jcl
 JNIEXPORT void JNICALL
 Java_net_kdt_pojavlaunch_utils_JREUtils_releaseBridgeWindow(ABI_COMPAT JNIEnv *env,
                                                             ABI_COMPAT jclass clazz) {
+    fclFgRelease("surface released");
     ANativeWindow_release(pojav_environ->pojavWindow);
 }
 
@@ -371,6 +452,23 @@ EXTERNAL_API void pojavSetWindowHint(int hint, int value) {
 
 EXTERNAL_API void pojavSwapBuffers() {
     atomic_fetch_add(&fps, 1);
+
+    /* ---------------- framegen: 采集 + 可选的插值帧合成 ---------------- */
+    int fgInterp = 0;
+    fclFgLoad();
+    if (g_fgState == 1) {
+        fclFgSize();
+        if (g_fgW > 0 && g_fgH > 0) {
+            g_fgApi.frame_ready(g_fgW, g_fgH);
+            /*
+             * M1：把插值帧画进 backbuffer，把游戏这一帧覆盖掉。
+             * 于是下面那次 swap 上屏的是插值帧，随后再 swap 一次出真实帧，
+             * 时间顺序为 mid -> cur，不会倒放。
+             */
+            if (g_fgApi.present_m1) fgInterp = g_fgApi.present_m1(g_fgW, g_fgH);
+        }
+    }
+
     // SDL 模式（config_renderer 未匹配任何渲染桥）下这些调用必须为 no-op，
     // 否则 br_* 函数指针为 NULL 会空指针崩溃（fixPojavGLContext 路径）
     if (pojav_environ->config_renderer == RENDERER_VK_ZINK
@@ -379,6 +477,23 @@ EXTERNAL_API void pojavSwapBuffers() {
     }
     if (pojav_environ->config_renderer == RENDERER_VIRGL) {
         virglSwapBuffers();
+    }
+
+    /* ---------------- framegen: 第二次上屏 ---------------- */
+    if (g_fgState == 1 && g_fgW > 0) {
+        int second = 0;
+        if (fgInterp && g_fgApi.present_real) {
+            second = g_fgApi.present_real(g_fgW, g_fgH);   /* M1：真实帧 */
+        } else if (g_fgApi.present_extra) {
+            second = g_fgApi.present_extra(g_fgW, g_fgH);  /* M0：重复帧，测开销 */
+        }
+        if (second) {
+            if (pojav_environ->config_renderer == RENDERER_VIRGL) {
+                virglSwapBuffers();
+            } else if (br_swap_buffers != NULL) {
+                br_swap_buffers();
+            }
+        }
     }
 }
 

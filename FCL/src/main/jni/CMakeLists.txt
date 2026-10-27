@@ -333,3 +333,23 @@ add_library(
         SHARED
         flite/flite_cmu_us_kal16.c
 )
+
+# ===== fcl_framegen =====
+# 平铺布局：所有源文件与 jni/CMakeLists.txt 同目录，不需要子目录
+add_library(fcl_framegen SHARED
+        fg_core.c
+        fg_m1.c)
+
+target_include_directories(fcl_framegen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_compile_options(fcl_framegen PRIVATE
+        -Wall -Wextra -O2 -fvisibility=hidden)
+
+target_link_libraries(fcl_framegen PRIVATE
+        log
+        android
+        dl)
+
+set_target_properties(fcl_framegen PROPERTIES
+        OUTPUT_NAME "fcl_framegen"
+        PREFIX "lib")
