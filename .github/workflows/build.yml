@@ -12,12 +12,27 @@ on:
   workflow_dispatch:
   workflow_call:
 
+# ===================================================================
+# 与官方 build.yml 的唯一差别：matrix 只保留 arm64。
+#
+# 官方一次并行编 5 个架构（all / arm / arm64 / x86 / x86_64），每个都要
+# 从源码编 GL4ES、OSMesa、VirGL 全套 native 库，排队加编译 40 分钟起。
+# 你只需要平板能装的那一个，所以砍到 1 个，通常 15 分钟内出结果。
+#
+# 想恢复官方行为，把 arch 那行改回：
+#   arch: ["all", "arm", "arm64", "x86", "x86_64"]
+#
+# 另外注意第 42/48 行的条件：fork 之后 github.repository_owner 不是
+# FCL-Team，所以会自动走 debug 构建，不需要 keystore 等 secrets。
+# 这就是为什么 fork 出来的仓库能直接出 APK。
+# ===================================================================
+
 jobs:
   build:
     name: Build for ${{matrix.arch}}
     strategy:
       matrix:
-        arch: ["all", "arm", "arm64", "x86", "x86_64"]
+        arch: ["arm64"]
       fail-fast: false
     env:
       FCL_KEYSTORE_PASSWORD: ${{ secrets.FCL_KEYSTORE_PASSWORD }}
@@ -56,3 +71,12 @@ jobs:
           name: app-${{matrix.arch}}
           path: FCL/build/outputs/apk/*/*
         #  retention-days: 1
+
+      # 单独把插帧模块捞出来。以后改插帧逻辑只要下这几百 KB 的 .so，
+      # 拷到 /sdcard/FCL/ 重启游戏就生效，不用再装 160MB 的 APK。
+      - name: Upload framegen module
+        uses: actions/upload-artifact@v6
+        with:
+          name: fcl_framegen-so
+          path: "**/libfcl_framegen.so"
+          if-no-files-found: warn
