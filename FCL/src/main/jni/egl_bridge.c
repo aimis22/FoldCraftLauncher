@@ -84,16 +84,56 @@ static int      g_fgState;   /* 0=未加载/已释放  1=可用  2=加载失败 
 static int      g_fgW, g_fgH;
 static int      g_fgSinceRelease;
 
+/*
+ * 私有目录下的插帧库路径：/data/user/0/<pkg>/files/libfcl_framegen.so
+ *
+ * 为什么不用 /sdcard：那里的 SELinux 标签是 media_rw_data_file，禁止执行代码，
+ * dlopen 会被直接拒绝。应用私有目录虽然也在「可写位置」的管制范围内，但
+ * debuggable 包（fordebug 变体）豁免这条限制，所以能加载进来。
+ *
+ * 这样迭代插帧逻辑时，只要 adb push 一个新的 .so 到私有目录、重启游戏即可，
+ * 不用重新安装 160MB 的 APK。
+ */
+static const char *fclFgPrivateLib(void) {
+    static char p[256];
+    if (p[0]) return p;
+
+    char pkg[128] = { 0 };
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (f) {
+        size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
+        fclose(f);
+        pkg[n] = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (pkg[i] == ':') { pkg[i] = 0; break; }
+        }
+    }
+    if (!pkg[0]) return NULL;
+
+    snprintf(p, sizeof p, "/data/user/0/%s/files/libfcl_framegen.so", pkg);
+    return p;
+}
+
 static void fclFgLoad(void) {
     if (g_fgState == 1) return;
     if (g_fgState == 2) return;
 
-    void *h = dlopen("libfcl_framegen.so", RTLD_NOW | RTLD_LOCAL);
+    /*
+     * 加载顺序：私有目录（可热更新）-> APK 内置（保底）
+     */
+    const char *priv = fclFgPrivateLib();
+    void *h = priv ? dlopen(priv, RTLD_NOW | RTLD_LOCAL) : NULL;
+    const char *src = "private";
+    if (!h) {
+        h = dlopen("libfcl_framegen.so", RTLD_NOW | RTLD_LOCAL);
+        src = "builtin";
+    }
     if (!h) {
         g_fgState = 2;
         FG_LOG("libfcl_framegen.so not found: %s", dlerror());
         return;
     }
+    FG_LOG("libfcl_framegen.so loaded from %s", src);
 
     g_fgApi.abi           = (int  (*)(void))     dlsym(h, "fcl_fg_abi_version");
     g_fgApi.init          = (int  (*)(void))     dlsym(h, "fcl_fg_init");

@@ -22,9 +22,143 @@
 #include "fg_internal.h"
 
 #define TAG "FclFrameGen"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+/* ------------------------------------------------------------------ */
+/* 日志：logcat + 文件双写                                             */
+/*                                                                     */
+/* 澎湃 OS 会过滤第三方应用的 native 日志，__android_log_print 写出去   */
+/* 的内容在 logcat 里搜不到。所以每行都同时追加到文件，用文件管理器直接 */
+/* 打开就能看，不依赖 adb。                                            */
+/* ------------------------------------------------------------------ */
+
+#include <stdarg.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+
+static char g_logPath[256];
+
+static void fg_self_pkg(char *out, size_t cap) {
+    out[0] = 0;
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (!f) return;
+    size_t n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = 0;
+    /* cmdline 可能是 "pkg:process"，只取包名部分 */
+    for (size_t i = 0; i < n; i++) {
+        if (out[i] == ':') { out[i] = 0; break; }
+    }
+}
+
+static int fg_can_write(const char *p) {
+    FILE *f = fopen(p, "a");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void fg_pick_log_path(void) {
+    if (g_logPath[0]) return;
+
+    /* 首选 FCL 自己的外部目录：用户用文件管理器能直接翻到 */
+    mkdir(FG_EXT_DIR, 0777);
+    snprintf(g_logPath, sizeof g_logPath, "%s%s", FG_EXT_DIR, FG_LOG_FILE);
+    if (fg_can_write(g_logPath)) return;
+
+    /* 退回应用外部私有目录：一定有权限，但要 adb pull 才能拿出来 */
+    char pkg[128];
+    fg_self_pkg(pkg, sizeof pkg);
+    snprintf(g_logPath, sizeof g_logPath,
+             "/sdcard/Android/data/%s/files/framegen.log", pkg);
+    if (fg_can_write(g_logPath)) return;
+
+    g_logPath[0] = 0;
+}
+
+static void fg_vlog(int prio, const char *lvl, const char *fmt, va_list ap) {
+    va_list ap2;
+    va_copy(ap2, ap);
+    __android_log_vprint(prio, TAG, fmt, ap);
+
+    fg_pick_log_path();
+    if (g_logPath[0]) {
+        FILE *f = fopen(g_logPath, "a");
+        if (f) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            fprintf(f, "[%6ld.%03ld] %s ", (long) ts.tv_sec,
+                    ts.tv_nsec / 1000000L, lvl);
+            vfprintf(f, fmt, ap2);
+            fputc('\n', f);
+            fclose(f);
+        }
+    }
+    va_end(ap2);
+}
+
+static void LOGI(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    fg_vlog(ANDROID_LOG_INFO, "I", fmt, ap);
+    va_end(ap);
+}
+
+static void LOGW(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    fg_vlog(ANDROID_LOG_WARN, "W", fmt, ap);
+    va_end(ap);
+}
+
+static void LOGE(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    fg_vlog(ANDROID_LOG_ERROR, "E", fmt, ap);
+    va_end(ap);
+}
+
+/* ------------------------------------------------------------------ */
+/* 运行时配置：/sdcard/FCL/framegen.cfg，改完重启游戏生效              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int   bench_finish;
+    int   stats_every;
+} FgRuntime;
+
+static FgRuntime g_rt = { FG_RT_DEF_BENCH, FG_RT_DEF_STATS };
+
+static void fg_rt_load(void) {
+    char p[256];
+    snprintf(p, sizeof p, "%s%s", FG_EXT_DIR, FG_CFG_FILE);
+
+    mkdir(FG_EXT_DIR, 0777);
+
+    FILE *f = fopen(p, "r");
+    if (!f) {
+        /* 没有就写一份默认的出来，用户照着改就行 */
+        f = fopen(p, "w");
+        if (f) {
+            fprintf(f, "# fcl_framegen runtime config\n");
+            fprintf(f, "# bench_finish=1: 每帧 glFinish，测真实 GPU 耗时（会掉帧）\n");
+            fprintf(f, "# bench_finish=0: 日常模式，不掉帧\n");
+            fprintf(f, "bench_finish=%d\n", g_rt.bench_finish);
+            fprintf(f, "# 每累计多少帧写一行统计\n");
+            fprintf(f, "stats_every=%d\n", g_rt.stats_every);
+            fclose(f);
+        }
+        return;
+    }
+
+    char line[160];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        char k[64], v[64];
+        if (sscanf(line, "%63[^= \t]=%63s", k, v) != 2) continue;
+        if      (!strcmp(k, "bench_finish")) g_rt.bench_finish = atoi(v);
+        else if (!strcmp(k, "stats_every"))  g_rt.stats_every  = atoi(v);
+    }
+    fclose(f);
+
+    if (g_rt.stats_every < 10) g_rt.stats_every = 10;
+}
 
 #ifndef GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS
 #define GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 0x90EB
@@ -213,6 +347,12 @@ int fcl_fg_abi_version(void) { return FCL_FG_ABI_VERSION; }
 int fcl_fg_init(void) {
     if (g_inited) return 0;
 
+    /* 先读运行时配置和日志路径，后面所有日志才有地方落 */
+    fg_pick_log_path();
+    fg_rt_load();
+    LOGI("init: bench_finish=%d stats_every=%d", g_rt.bench_finish, g_rt.stats_every);
+    LOGI("init: log file = %s", g_logPath[0] ? g_logPath : "(unavailable)");
+
     RESOLVE(GetString,              PFN_GetString,              "glGetString");
     RESOLVE(GetIntegerv,            PFN_GetIntegerv,            "glGetIntegerv");
     RESOLVE(GetError,               PFN_GetError,               "glGetError");
@@ -255,7 +395,7 @@ int fcl_fg_init(void) {
              ver ? ver : "?", rend ? rend : "?", glsl ? glsl : "?",
              (int) g_maxColorAtt, (int) g_maxComputeWG,
              g_hasBlit ? "symbol-ok" : "missing",
-             FG_BASE_HZ, FG_TARGET_HZ, FG_MULT, FG_DEFAULT_TIER, FG_BENCH_FINISH);
+             FG_BASE_HZ, FG_TARGET_HZ, FG_MULT, FG_DEFAULT_TIER, g_rt.bench_finish);
 
     LOGI("probe: %s", g_probe);
 
@@ -347,15 +487,15 @@ void fcl_fg_on_frame_ready(int width, int height) {
     long long t1 = now_ns();
     g_capNs += t1 - t0;
 
-#if FG_BENCH_FINISH
-    /*
-     * 必须等 GPU 真的做完。CopyTexSubImage2D / BlitFramebuffer 都是异步的，
-     * 不等的话测到的只是驱动受理命令的时间（0.1ms 级），会把开销严重低估，
-     * 得出「这条路很便宜」的错误结论。
-     */
-    gl.Finish();
-    g_capGpuNs += now_ns() - t0;
-#endif
+    if (g_rt.bench_finish) {
+        /*
+         * 必须等 GPU 真的做完。CopyTexSubImage2D / BlitFramebuffer 都是异步的，
+         * 不等的话测到的只是驱动受理命令的时间（0.1ms 级），会把开销严重低估，
+         * 得出「这条路很便宜」的错误结论。
+         */
+        gl.Finish();
+        g_capGpuNs += now_ns() - t0;
+    }
 
     g_frames++;
 }
@@ -380,25 +520,22 @@ int fcl_fg_present_extra(int width, int height) {
     long long t1 = now_ns();
     g_extraNs += t1 - t0;
 
-#if FG_BENCH_FINISH
-    gl.Finish();
-    g_extraGpuNs += now_ns() - t0;
-#endif
+    if (g_rt.bench_finish) {
+        gl.Finish();
+        g_extraGpuNs += now_ns() - t0;
+    }
 
     if (scissor) gl.Enable(GL_SCISSOR_TEST);
     fg_state_restore(&s);
 
     g_samples++;
 
-    if (g_samples >= FG_STATS_EVERY) {
+    if (g_samples >= g_rt.stats_every) {
         const double n = (double) g_samples;
-#if FG_BENCH_FINISH
-        const double cap = (double) g_capGpuNs / n / 1e6;
-        const double ext = (double) g_extraGpuNs / n / 1e6;
-#else
-        const double cap = (double) g_capNs / n / 1e6;
-        const double ext = (double) g_extraNs / n / 1e6;
-#endif
+        const double cap = g_rt.bench_finish ? (double) g_capGpuNs / n / 1e6
+                                             : (double) g_capNs   / n / 1e6;
+        const double ext = g_rt.bench_finish ? (double) g_extraGpuNs / n / 1e6
+                                             : (double) g_extraNs   / n / 1e6;
         const double sum = cap + ext;
         const char *verdict = (sum < FG_ACCEPT_MS) ? "PASS"
                             : (sum < FG_ABORT_MS)  ? "TIGHT" : "ABORT";
@@ -408,11 +545,11 @@ int fcl_fg_present_extra(int width, int height) {
              "slot=%.1fms  %s  (n=%d, skipped=%lld)",
              cap, ext, sum, FG_SLOT_MS, verdict, g_samples, g_skipped);
 
-#if FG_BENCH_FINISH
-        /* 对照：不 glFinish 时的数字，用来确认测量方式确实是必要的 */
-        LOGI("[M0] submit-only: capture=%.3fms  extra-present=%.3fms",
-             (double) g_capNs / n / 1e6, (double) g_extraNs / n / 1e6);
-#endif
+        if (g_rt.bench_finish) {
+            /* 对照：不 glFinish 时的数字，用来确认测量方式确实是必要的 */
+            LOGI("[M0] submit-only: capture=%.3fms  extra-present=%.3fms",
+                 (double) g_capNs / n / 1e6, (double) g_extraNs / n / 1e6);
+        }
 
         g_capNs = g_extraNs = g_capGpuNs = g_extraGpuNs = 0;
         g_samples = 0;

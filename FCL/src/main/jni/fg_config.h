@@ -61,8 +61,28 @@
  * 关掉它测到的只是「命令提交时间」（通常 0.1ms 级），会把开销严重低估。
  * 代价是每帧多一次同步等待，所以只在测 M0 时开。
  * M1 之后关掉，改为看帧时间差值。
+ *
+ * 默认 0：日常能玩。要测真实 GPU 耗时时把 /sdcard/FCL/framegen.cfg 里的
+ * bench_finish 改成 1，重启游戏即可，不需要重新编译。
  */
-#define FG_BENCH_FINISH     1
+#define FG_BENCH_FINISH     0
+
+/* ------------------------------------------------------------------ */
+/* 运行时配置 / 日志落盘                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 澎湃 OS 会把第三方应用的 native 日志吃掉，logcat 里搜不到 FclFrameGen。
+ * 所以统计结果同时写进文件，用文件管理器直接打开看。
+ * 优先 /sdcard/FCL/framegen.log，写不进去就退回应用外部私有目录。
+ */
+#define FG_EXT_DIR          "/sdcard/FCL"
+#define FG_LOG_FILE         "/framegen.log"
+#define FG_CFG_FILE         "/framegen.cfg"
+
+/* 没找到 cfg 时用这两个值写一份默认配置出来 */
+#define FG_RT_DEF_BENCH     FG_BENCH_FINISH
+#define FG_RT_DEF_STATS     FG_STATS_EVERY
 
 /* ------------------------------------------------------------------ */
 /* 内存门控                                                            */
